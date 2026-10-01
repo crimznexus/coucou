@@ -129,7 +129,7 @@ Anthropic API: no API key, nothing leaves your PC except web searches.
    cd windows
    npm install
    npm run pack
-   .elease\Coucou-Windows-setup.exe /S    # per-user install, no admin
+   .\release\Coucou-Windows-setup.exe /S    # per-user install, no admin
    ```
 4. Run it with the endpoint and model set:
    ```powershell
