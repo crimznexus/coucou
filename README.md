@@ -94,6 +94,58 @@ npm install
 npm run pack                # installer lands in windows/release/
 ```
 
+## Fork: local models (Ollama) + web search — Windows
+
+This fork lets the chat run on a **local model through Ollama** instead of the
+Anthropic API: no API key, nothing leaves your PC except web searches.
+
+**What changed**
+
+- Set `COUCOU_LLM_URL` and the chat talks to any Anthropic-compatible endpoint
+  (Ollama's `/v1/messages`) instead of `api.anthropic.com`. No key is needed.
+  `COUCOU_LLM_MODEL` picks the model. Leave both unset for the original behaviour.
+- In that mode the model gets two **read-only** tools, `web_search` (DuckDuckGo,
+  no key) and `fetch_url`, in a bounded tool loop (6 rounds per question).
+- It cannot touch your files or run commands. Claude Code hooks are unaffected.
+
+**Install and run (Windows)**
+
+1. Install [Ollama](https://ollama.com) and pull a model that supports tool
+   calling. `qwen3.5:9b` fits an 8 GB GPU:
+   ```powershell
+   ollama pull qwen3.5:9b
+   ```
+2. Give Ollama a bigger context window (the 4K default truncates search
+   results), then restart Ollama:
+   ```powershell
+   [Environment]::SetEnvironmentVariable('OLLAMA_CONTEXT_LENGTH','32768','User')
+   ```
+3. Build and install Coucou ([Rust](https://rustup.rs), Node 20+ and the MSVC
+   build tools are required):
+   ```powershell
+   git clone https://github.com/crimznexus/coucou.git
+   cd coucou
+   git checkout local-ollama-web-search
+   cd windows
+   npm install
+   npm run pack
+   .elease\Coucou-Windows-setup.exe /S    # per-user install, no admin
+   ```
+4. Run it with the endpoint and model set:
+   ```powershell
+   $env:COUCOU_LLM_URL='http://localhost:11434/v1/messages'
+   $env:COUCOU_LLM_MODEL='qwen3.5:9b'
+   Start-Process "$env:LOCALAPPDATA\Coucou\coucou.exe"
+   ```
+   To make it permanent, save both with
+   `[Environment]::SetEnvironmentVariable(name, value, 'User')` and sign out and
+   back in, so launches from the Start menu see them.
+
+Ollama must be running. The first answer is slow while the model loads, and
+DuckDuckGo may occasionally rate-limit searches ("no results" — retry later).
+Models without tool support (for example `deepseek-coder`) can chat but cannot
+search.
+
 ## Setup
 
 Click the Coucou icon in the menu bar (macOS) or in the system tray (Windows) → **Settings…**
