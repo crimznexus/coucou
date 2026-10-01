@@ -17,6 +17,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// a fallback model inside the same call, so the island never shows a dead end.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_TOKENS: u32 = 4096;
+const MAX_TOOL_ROUNDS: u32 = 6;
 /// Text and code files are inlined; anything larger is skipped, as on macOS.
 const MAX_INLINE_TEXT: u64 = 200_000;
 
@@ -26,6 +27,8 @@ const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at th
 You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
+
+const LOCAL_SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. You have two tools: web_search and fetch_url. Search the web for anything current or that you are not sure about, and read the pages before answering, instead of guessing. Respond in the user's language. Be concise. No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
 
 #[derive(Default)]
 pub struct Chat {
@@ -76,8 +79,19 @@ pub async fn send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let key = secrets::get("anthropic-api-key")
-        .ok_or_else(|| "API key missing. Open settings.".to_string())?;
+    // Local override (e.g. Ollama's Anthropic-compatible endpoint): no key, no
+    // web-search tool, no fallback beta.
+    let local_url = std::env::var("COUCOU_LLM_URL").ok().filter(|u| !u.is_empty());
+    let model = std::env::var("COUCOU_LLM_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty() && local_url.is_some())
+        .unwrap_or_else(|| model.to_string());
+    let key = if local_url.is_some() {
+        "local".to_string()
+    } else {
+        secrets::get("anthropic-api-key")
+            .ok_or_else(|| "API key missing. Open settings.".to_string())?
+    };
 
     let mut content: Vec<Value> = Vec::new();
 
@@ -105,42 +119,70 @@ pub async fn send(
 
     chat.push(json!({ "role": "user", "content": content }));
 
-    let body = json!({
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "tools": [{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }],
-        "fallbacks": "default",
-        "messages": chat.snapshot(),
-    });
-
-    let response = match call(&key, &body).await {
-        Ok(v) => v,
-        Err(err) => {
-            chat.pop(); // keep the history consistent with what the model saw
-            return Err(err);
+    // Local models get our web tools: the model asks for one, we run it, and the
+    // result goes back as a user turn.
+    let mut rounds = 0;
+    let blocks = loop {
+        let mut body = json!({
+            "model": model,
+            "max_tokens": MAX_TOKENS,
+            "system": if local_url.is_some() { LOCAL_SYSTEM_PROMPT } else { SYSTEM_PROMPT },
+            "messages": chat.snapshot(),
+        });
+        if local_url.is_none() {
+            body["tools"] = json!([{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }]);
+            body["fallbacks"] = json!("default");
+        } else {
+            body["tools"] = crate::agent::definitions();
         }
+
+        let response = match call(&key, &body, local_url.as_deref()).await {
+            Ok(v) => v,
+            Err(err) => {
+                chat.pop(); // keep the history consistent with what the model saw
+                return Err(err);
+            }
+        };
+
+        // A policy decline comes back as HTTP 200 with stop_reason "refusal".
+        if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
+            chat.pop();
+            let why = response
+                .get("stop_details")
+                .and_then(|d| d.get("explanation"))
+                .and_then(Value::as_str)
+                .unwrap_or("Claude declined this one.");
+            return Err(why.to_string());
+        }
+
+        let Some(blocks) = response.get("content").and_then(Value::as_array).cloned() else {
+            chat.pop();
+            return Err("Unexpected API response.".into());
+        };
+
+        // Store the whole content — tool_use / tool_result blocks included — so the
+        // next turn has the right context.
+        chat.push(json!({ "role": "assistant", "content": blocks.clone() }));
+
+        let calls: Vec<&Value> = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .collect();
+        if local_url.is_none() || calls.is_empty() || rounds >= MAX_TOOL_ROUNDS {
+            break blocks;
+        }
+        rounds += 1;
+
+        let mut results = Vec::new();
+        for call in calls {
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+            let input = call.get("input").cloned().unwrap_or(Value::Null);
+            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+            let output = crate::agent::run(name, &input).await;
+            results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": output }));
+        }
+        chat.push(json!({ "role": "user", "content": results }));
     };
-
-    // A policy decline comes back as HTTP 200 with stop_reason "refusal".
-    if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
-        chat.pop();
-        let why = response
-            .get("stop_details")
-            .and_then(|d| d.get("explanation"))
-            .and_then(Value::as_str)
-            .unwrap_or("Claude declined this one.");
-        return Err(why.to_string());
-    }
-
-    let Some(blocks) = response.get("content").and_then(Value::as_array).cloned() else {
-        chat.pop();
-        return Err("Unexpected API response.".into());
-    };
-
-    // Store the whole content — tool_use / tool_result blocks included — so the
-    // next turn has the right context.
-    chat.push(json!({ "role": "assistant", "content": blocks.clone() }));
 
     let text = blocks
         .iter()
@@ -157,18 +199,21 @@ pub async fn send(
     Ok(ChatReply { text })
 }
 
-async fn call(key: &str, body: &Value) -> Result<Value, String> {
+async fn call(key: &str, body: &Value, url: Option<&str>) -> Result<Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client
-        .post(ENDPOINT)
+    let mut req = client
+        .post(url.unwrap_or(ENDPOINT))
         .header("x-api-key", key)
         .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", FALLBACK_BETA)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if url.is_none() {
+        req = req.header("anthropic-beta", FALLBACK_BETA);
+    }
+    let response = req
         .json(body)
         .send()
         .await
